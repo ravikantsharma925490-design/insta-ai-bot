@@ -1,2 +1,2 @@
- instagrapi>=2.1.0
+instagrapi>=2.1.0
 Flask

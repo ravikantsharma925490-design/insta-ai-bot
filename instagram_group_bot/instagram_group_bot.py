@@ -170,8 +170,16 @@ class GroupModerationBot:
             if os.path.exists(SESSION_FILE):
                 self.cl.load_settings(SESSION_FILE)
                 self.cl.login(self.username, self.password)
-                # verify session still valid
-                self.cl.account_info()
+                # NOTE: we deliberately do NOT call an extra verification
+                # endpoint here (e.g. account_info/get_timeline_feed). On
+                # some hosting providers, Instagram returns 403 on those
+                # verification calls even for a perfectly valid session
+                # (datacenter IPs get extra scrutiny), which was wrongly
+                # triggering a fresh username/password login every time —
+                # and that fresh login fails with "Instagram is out of
+                # date" for unrelated reasons. Trust the loaded session;
+                # if it's genuinely invalid, real calls later will raise
+                # LoginRequired and run_forever() already re-logs-in then.
                 log.info("Logged in using saved session.")
             else:
                 raise FileNotFoundError
