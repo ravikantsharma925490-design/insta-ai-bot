@@ -169,17 +169,17 @@ class GroupModerationBot:
         try:
             if os.path.exists(SESSION_FILE):
                 self.cl.load_settings(SESSION_FILE)
-                self.cl.login(self.username, self.password)
-                # NOTE: we deliberately do NOT call an extra verification
-                # endpoint here (e.g. account_info/get_timeline_feed). On
-                # some hosting providers, Instagram returns 403 on those
-                # verification calls even for a perfectly valid session
-                # (datacenter IPs get extra scrutiny), which was wrongly
-                # triggering a fresh username/password login every time —
-                # and that fresh login fails with "Instagram is out of
-                # date" for unrelated reasons. Trust the loaded session;
-                # if it's genuinely invalid, real calls later will raise
-                # LoginRequired and run_forever() already re-logs-in then.
+                # IMPORTANT: do NOT call self.cl.login(username, password)
+                # again here. Even with a loaded session, instagrapi's
+                # login() can still kick off a full fresh-login flow
+                # (bloks / device-attestation steps) — and that flow fails
+                # with "Instagram is out of date" on this host. Loading the
+                # settings alone is enough to restore the session; if it's
+                # genuinely invalid, real API calls later will raise
+                # LoginRequired and run_forever() already re-logs-in then
+                # (falling into the except-branch below via a fresh call
+                # to this same method).
+                self.cl.username = self.username
                 log.info("Logged in using saved session.")
             else:
                 raise FileNotFoundError
