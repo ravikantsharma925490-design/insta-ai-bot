@@ -29,7 +29,7 @@ RUN LOCALLY
 DEPLOY (Render / Railway / similar)
 ------------------------------------
     Start command:  python app.py
-    Set env vars:   IG_BOT_USERNAME, IG_BOT_PASSWORD, IG_THREAD_ID
+    Set env vars:   IG_BOT_USERNAME, IG_BOT_PASSWORD
     Instance type:  This is a paid/background-capable web service —
                     free tiers that spin instances down on idle are NOT
                     suitable, since the bot must run continuously.
@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify
 
-from instagram_group_bot import GroupModerationBot, BOT_USERNAME, BOT_PASSWORD, THREAD_ID, log
+from instagram_group_bot import GroupModerationBot, BOT_USERNAME, BOT_PASSWORD, log
 
 app = Flask(__name__)
 
@@ -52,10 +52,10 @@ bot_state = {
     "last_poll_at": None,
     "status": "starting",   # starting | running | error | stopped
     "last_error": None,
-    "known_members": 0,
+    "monitored_groups": 0,
 }
 
-bot_instance = GroupModerationBot(BOT_USERNAME, BOT_PASSWORD, THREAD_ID)
+bot_instance = GroupModerationBot(BOT_USERNAME, BOT_PASSWORD)
 
 
 def run_bot_with_status_updates():
@@ -63,16 +63,16 @@ def run_bot_with_status_updates():
     bot_state["started_at"] = datetime.now(timezone.utc).isoformat()
     try:
         bot_instance.login()
-        bot_instance.prime_state()
+        bot_instance.refresh_monitored_threads()
         bot_state["status"] = "running"
-        bot_state["known_members"] = len(bot_instance.known_user_ids)
+        bot_state["monitored_groups"] = len(bot_instance.monitored_thread_ids)
         log.info("Bot started inside web service thread.")
 
         while True:
             try:
                 bot_instance.poll_once()
                 bot_state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
-                bot_state["known_members"] = len(bot_instance.known_user_ids)
+                bot_state["monitored_groups"] = len(bot_instance.monitored_thread_ids)
                 bot_state["status"] = "running"
                 bot_state["last_error"] = None
             except Exception as e:

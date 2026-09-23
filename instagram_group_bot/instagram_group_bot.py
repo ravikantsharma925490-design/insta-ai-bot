@@ -5,18 +5,22 @@ Built on top of the `instagrapi` library.
 
 WHAT THIS BOT DOES
 -------------------
-1. Welcomes new members who join a monitored group DM thread.
-2. Scans incoming text for bad words / profanity (Hindi + English list, editable).
-3. Scans incoming text for spam keywords and links (URLs, t.me, wa.me, .com, etc).
-4. Detects reel/video/media shares in the thread (instagrapi cannot inspect the
-   content of a shared reel before it renders — it can only detect that a media
-   item of a certain type was shared and act on it after the fact).
-5. On any rule violation, posts an alert message explaining the reason and then
-   attempts to remove the offending user from the thread.
+1. Automatically discovers every GROUP chat thread your bot account is part
+   of — no manual THREAD_ID needed. New groups the account gets added to are
+   picked up automatically on the next poll cycle.
+2. Welcomes new members who join any monitored group thread.
+3. Scans incoming text for bad words / profanity (Hindi + English list, editable).
+4. Scans incoming text for spam keywords and links (URLs, t.me, wa.me, .com, etc).
+5. Detects reel/video/media shares in any monitored thread (instagrapi cannot
+   inspect the content of a shared reel before it renders — it can only
+   detect that a media item of a certain type was shared and act on it after
+   the fact).
+6. On any rule violation, posts an alert message explaining the reason and
+   then attempts to remove the offending user from that thread.
 
 IMPORTANT — READ BEFORE RUNNING
 --------------------------------
-* Automating actions on an Instagram account (auto-messaging, polling a thread
+* Automating actions on an Instagram account (auto-messaging, polling threads
   in a loop, programmatically removing users) is against Instagram's Terms of
   Service. Accounts that do this are routinely rate-limited, challenged, or
   permanently banned — a longer delay reduces but does not remove that risk.
@@ -29,6 +33,9 @@ IMPORTANT — READ BEFORE RUNNING
   and remove the sender / delete the message so it doesn't stay visible long.
 * Store credentials as environment variables in production, not as plaintext
   in this file (see CONFIGURATION below).
+* A single account polling MANY group threads every few seconds multiplies
+  the number of API calls per cycle. If the bot is in a lot of groups,
+  consider raising LOOP_DELAY_SECONDS so total request volume stays low.
 
 INSTALL
 -------
@@ -44,7 +51,6 @@ import re
 import time
 import logging
 import traceback
-from datetime import datetime
 from typing import Set, Dict, Any, Optional
 
 from instagrapi import Client
@@ -58,10 +64,10 @@ from instagrapi.exceptions import ClientError, LoginRequired
 BOT_USERNAME = os.environ.get("IG_BOT_USERNAME", "your_bot_username_here")
 BOT_PASSWORD = os.environ.get("IG_BOT_PASSWORD", "your_bot_password_here")
 
-# The numeric thread ID of the group DM you want to monitor.
-# You can get this by logging in with instagrapi once and calling
-# cl.direct_threads() to list your threads and their IDs.
-THREAD_ID = os.environ.get("IG_THREAD_ID", "1234567890123456789")
+# No THREAD_ID needed anymore — the bot auto-discovers every GROUP thread
+# (3+ participants) the account is part of, and monitors all of them.
+# How often (in poll cycles) to re-scan for newly-added group threads.
+THREAD_DISCOVERY_EVERY_N_POLLS = 12  # e.g. 12 * 5s = every ~60s
 
 # Session file so we don't have to re-login (and trigger checkpoints) every run
 SESSION_FILE = "ig_session.json"
@@ -144,16 +150,17 @@ log = logging.getLogger("ig_group_bot")
 # =====================================================================
 
 class GroupModerationBot:
-    def __init__(self, username: str, password: str, thread_id: str):
+    def __init__(self, username: str, password: str):
         self.username = username
         self.password = password
-        self.thread_id = thread_id
         self.cl = Client()
 
-        # State tracked across poll cycles
-        self.known_user_ids: Set[int] = set()
-        self.seen_message_ids: Set[str] = set()
-        self.initialized = False
+        # Per-thread state, keyed by thread_id (str)
+        self.known_user_ids: Dict[str, Set[int]] = {}
+        self.seen_message_ids: Dict[str, Set[str]] = {}
+        self.monitored_thread_ids: Set[str] = set()
+
+        self._poll_count = 0
 
     # -----------------------------------------------------------------
     # LOGIN
@@ -164,7 +171,7 @@ class GroupModerationBot:
                 self.cl.load_settings(SESSION_FILE)
                 self.cl.login(self.username, self.password)
                 # verify session still valid
-               self.cl.account_info()
+                self.cl.account_info()
                 log.info("Logged in using saved session.")
             else:
                 raise FileNotFoundError
@@ -176,21 +183,54 @@ class GroupModerationBot:
             log.info("Fresh login successful, session saved.")
 
     # -----------------------------------------------------------------
-    # INITIAL STATE
+    # GROUP THREAD DISCOVERY
     # -----------------------------------------------------------------
-    def prime_state(self) -> None:
-        """Snapshot current members and message ids so we only react to
-        things that happen AFTER the bot starts, not the entire history."""
-        thread = self.cl.direct_thread(self.thread_id)
-        self.known_user_ids = {u.pk for u in thread.users}
-        # include the bot's own account
-        self.known_user_ids.add(self.cl.user_id)
-        self.seen_message_ids = {item.id for item in thread.messages}
-        self.initialized = True
-        log.info(
-            "Primed state: %d known members, %d known messages.",
-            len(self.known_user_ids), len(self.seen_message_ids)
-        )
+    def discover_group_threads(self) -> Set[str]:
+        """Finds every thread the bot account is part of that looks like a
+        GROUP chat (more than 2 participants including the bot itself, or
+        instagrapi's own is_group flag when available)."""
+        group_ids: Set[str] = set()
+        try:
+            threads = self.cl.direct_threads(amount=100)
+            for thread in threads:
+                is_group = getattr(thread, "is_group", None)
+                if is_group is None:
+                    # Fallback: 2 participants = 1-on-1 DM, 3+ = group
+                    is_group = len(thread.users) > 1
+                if is_group:
+                    group_ids.add(str(thread.id))
+        except Exception as e:
+            log.error("Error while discovering group threads: %s", e)
+        return group_ids
+
+    def prime_thread_state(self, thread_id: str) -> None:
+        """Snapshot current members and message ids for one thread so we
+        only react to things that happen AFTER the bot starts watching it."""
+        try:
+            thread = self.cl.direct_thread(thread_id)
+            self.known_user_ids[thread_id] = {u.pk for u in thread.users}
+            self.known_user_ids[thread_id].add(self.cl.user_id)
+            self.seen_message_ids[thread_id] = {item.id for item in thread.messages}
+            log.info(
+                "Primed thread %s: %d known members, %d known messages.",
+                thread_id,
+                len(self.known_user_ids[thread_id]),
+                len(self.seen_message_ids[thread_id]),
+            )
+        except Exception as e:
+            log.error("Failed to prime state for thread %s: %s", thread_id, e)
+
+    def refresh_monitored_threads(self) -> None:
+        """Discovers group threads and starts tracking any new ones found
+        (without touching state for threads already being monitored)."""
+        discovered = self.discover_group_threads()
+        new_threads = discovered - self.monitored_thread_ids
+        for tid in new_threads:
+            log.info("New group thread discovered: %s", tid)
+            self.prime_thread_state(tid)
+        self.monitored_thread_ids |= discovered
+        if new_threads:
+            log.info("Now monitoring %d group thread(s) total.", len(self.monitored_thread_ids))
 
     # -----------------------------------------------------------------
     # RULE CHECKS
@@ -238,16 +278,16 @@ class GroupModerationBot:
     # -----------------------------------------------------------------
     # ACTIONS
     # -----------------------------------------------------------------
-    def send_message(self, text: str) -> None:
+    def send_message(self, thread_id: str, text: str) -> None:
         try:
-            self.cl.direct_send(text, thread_ids=[int(self.thread_id)])
-            log.info("Sent message: %s", text[:80])
+            self.cl.direct_send(text, thread_ids=[int(thread_id)])
+            log.info("[%s] Sent message: %s", thread_id, text[:80])
         except Exception as e:
-            log.error("Failed to send message: %s", e)
+            log.error("[%s] Failed to send message: %s", thread_id, e)
         finally:
             time.sleep(ACTION_COOLDOWN_SECONDS)
 
-    def welcome_new_user(self, user_id: int) -> None:
+    def welcome_new_user(self, thread_id: str, user_id: int) -> None:
         try:
             user_info = self.cl.user_info(user_id)
             username = user_info.username
@@ -256,26 +296,26 @@ class GroupModerationBot:
             username = str(user_id)
 
         text = WELCOME_MESSAGE_TEMPLATE.format(username=username, rules=GROUP_RULES_TEXT)
-        self.send_message(text)
+        self.send_message(thread_id, text)
 
-    def remove_user(self, user_id: int, reason: str) -> None:
+    def remove_user(self, thread_id: str, user_id: int, reason: str) -> None:
         try:
             username = self._safe_username(user_id)
             alert = f"⚠️ @{username} को ग्रुप से हटा दिया गया है। कारण: {reason}"
-            self.send_message(alert)
+            self.send_message(thread_id, alert)
 
-            removed = self.cl.direct_thread_remove_user(self.thread_id, user_id)
+            removed = self.cl.direct_thread_remove_user(thread_id, user_id)
             if removed:
-                log.info("Removed user %s (%s). Reason: %s", username, user_id, reason)
+                log.info("[%s] Removed user %s (%s). Reason: %s", thread_id, username, user_id, reason)
             else:
-                log.warning("Remove call returned falsy for user %s", user_id)
+                log.warning("[%s] Remove call returned falsy for user %s", thread_id, user_id)
 
             # stop tracking them so we don't try to act on stale state
-            self.known_user_ids.discard(user_id)
+            self.known_user_ids.get(thread_id, set()).discard(user_id)
         except ClientError as e:
-            log.error("Instagram API error removing user %s: %s", user_id, e)
+            log.error("[%s] Instagram API error removing user %s: %s", thread_id, user_id, e)
         except Exception as e:
-            log.error("Unexpected error removing user %s: %s", user_id, e)
+            log.error("[%s] Unexpected error removing user %s: %s", thread_id, user_id, e)
         finally:
             time.sleep(ACTION_COOLDOWN_SECONDS)
 
@@ -286,28 +326,30 @@ class GroupModerationBot:
             return str(user_id)
 
     # -----------------------------------------------------------------
-    # POLL CYCLE
+    # POLL CYCLE (per thread)
     # -----------------------------------------------------------------
-    def poll_once(self) -> None:
-        thread = self.cl.direct_thread(self.thread_id)
+    def poll_thread_once(self, thread_id: str) -> None:
+        thread = self.cl.direct_thread(thread_id)
 
         # ---- 1. New member detection -> welcome message ----
         current_user_ids = {u.pk for u in thread.users}
-        new_user_ids = current_user_ids - self.known_user_ids
+        known = self.known_user_ids.setdefault(thread_id, set())
+        new_user_ids = current_user_ids - known
         for uid in new_user_ids:
             if uid == self.cl.user_id:
                 continue
-            log.info("New member detected: %s", uid)
-            self.welcome_new_user(uid)
-        self.known_user_ids |= current_user_ids
+            log.info("[%s] New member detected: %s", thread_id, uid)
+            self.welcome_new_user(thread_id, uid)
+        self.known_user_ids[thread_id] |= current_user_ids
 
         # ---- 2. New message detection -> content moderation ----
+        seen = self.seen_message_ids.setdefault(thread_id, set())
         # instagrapi returns messages newest-first; process oldest-first
-        new_items = [m for m in thread.messages if m.id not in self.seen_message_ids]
+        new_items = [m for m in thread.messages if m.id not in seen]
         new_items.reverse()
 
         for item in new_items:
-            self.seen_message_ids.add(item.id)
+            self.seen_message_ids[thread_id].add(item.id)
 
             sender_id = getattr(item, "user_id", None)
             if sender_id is None or sender_id == self.cl.user_id:
@@ -315,7 +357,7 @@ class GroupModerationBot:
 
             # --- Reels / video / external media check ---
             if self.is_blocked_media_item(item):
-                self.remove_user(sender_id, "रील्स/वीडियो/मीडिया शेयर करना इस ग्रुप में मना है")
+                self.remove_user(thread_id, sender_id, "रील्स/वीडियो/मीडिया शेयर करना इस ग्रुप में मना है")
                 continue
 
             # --- Text-based checks (bad words, spam, links) ---
@@ -323,15 +365,31 @@ class GroupModerationBot:
             if text:
                 reason = self.evaluate_text_message(text)
                 if reason:
-                    self.remove_user(sender_id, reason)
+                    self.remove_user(thread_id, sender_id, reason)
+
+    def poll_once(self) -> None:
+        """One full cycle: periodically re-discover group threads, then poll
+        every currently-monitored group thread."""
+        if self._poll_count % THREAD_DISCOVERY_EVERY_N_POLLS == 0:
+            self.refresh_monitored_threads()
+        self._poll_count += 1
+
+        for thread_id in list(self.monitored_thread_ids):
+            try:
+                self.poll_thread_once(thread_id)
+            except Exception as e:
+                log.error("[%s] Error polling thread: %s", thread_id, e)
 
     # -----------------------------------------------------------------
     # MAIN LOOP
     # -----------------------------------------------------------------
     def run_forever(self) -> None:
         self.login()
-        self.prime_state()
-        log.info("Bot is now monitoring thread %s every %ss.", self.thread_id, LOOP_DELAY_SECONDS)
+        self.refresh_monitored_threads()
+        log.info(
+            "Bot is now auto-monitoring %d group thread(s), polling every %ss.",
+            len(self.monitored_thread_ids), LOOP_DELAY_SECONDS,
+        )
 
         while True:
             try:
@@ -355,11 +413,11 @@ if __name__ == "__main__":
     if BOT_USERNAME.startswith("your_bot_username") or BOT_PASSWORD.startswith("your_bot_password"):
         log.warning(
             "You are using placeholder credentials. Set IG_BOT_USERNAME / "
-            "IG_BOT_PASSWORD / IG_THREAD_ID environment variables, or edit "
-            "the CONFIGURATION section at the top of this file."
+            "IG_BOT_PASSWORD environment variables, or edit the "
+            "CONFIGURATION section at the top of this file."
         )
 
-    bot = GroupModerationBot(BOT_USERNAME, BOT_PASSWORD, THREAD_ID)
+    bot = GroupModerationBot(BOT_USERNAME, BOT_PASSWORD)
     try:
         bot.run_forever()
     except KeyboardInterrupt:
