@@ -164,7 +164,7 @@ class GroupModerationBot:
                 self.cl.load_settings(SESSION_FILE)
                 self.cl.login(self.username, self.password)
                 # verify session still valid
-                self.cl.get_timeline_feed()
+               self.cl.account_info()
                 log.info("Logged in using saved session.")
             else:
                 raise FileNotFoundError
